@@ -1,0 +1,129 @@
+userSections = CASEDATA
+
+[GENERAL]
+#startFrom = "msh.fld+X"
+#startFrom = "r1v.fld,r1b.fld"
+startFrom = "../step_5/bz0.f00099"
+polynomialOrder = 5 #7
+numSteps = 2000 #2000000
+#dt = 4e-6
+#dt = 1e-6 
+dt = 1e-4
+timeStepper = tombo2
+
+checkpointControl = steps
+writeInterval = 20 #4000
+
+advectionSubCyclingSteps = 1
+
+regularization = hpfrt + nModes=1 + scalingCoeff=0.2/${dt} # N=3
+#regularization = hpfrt + nModes=2 + scalingCoeff=0.2/${dt} # N>3
+#regularization = gjp +scalingCoeff=0.8
+
+#scalars = temperature
+scalars = temperature, g1, g2  # IIIII USE_ISOTOPES
+
+#udf = "v20.udf"   # pairs with pink.hpp (= pink_v20.hpp) and v20.usr
+
+[OCCA]
+deviceNumber = 0
+backend = HIP
+
+[MESH]
+connectivityTol = 2e-4
+file = "bz_msh_D.re2"
+
+[FLUID PRESSURE]
+solver = gmres + flexible + nVector=50 # for initial transient
+smootherType = Jac+FourthOptChebyshev
+#preconditioner = semfem
+residualTol = 1e-4
+initialGuess = projection+nVector=20
+
+[FLUID VELOCITY]
+boundaryTypeMap = v,v,v,O,O, O,w,w,w,w
+residualTol = 1e-04
+#solver = none
+
+[SCALAR TEMPERATURE]
+mesh = fluid + solid
+boundaryTypeMap = t,t,t,I,I, I,f,I,I,I, I,I,I,I,I
+residualTol = 1e-04
+
+[MHD INDUCTIONLESS]
+mesh = fluid + solid
+#solver = gmres + flexible + nVector=30 # for initial transient
+#pMGSchedule = p=7+degree=3, p=5+degree=3, p=3+degree=3, p=1, p=3+degree=3, p=5+degree=3, p=7+degree=3
+smootherType = Jac+FourthOptChebyshev
+coarseGridDiscretization = fem+Galerkin
+boundaryTypeMap = t,t,t,I,I, I,I,I,I,I, I,I,I,I,I
+
+useUlocScale = true # for s2->s3 scale
+
+bx = 0.0
+by = 0.0125
+bz = 0.0
+
+# --- USE_ISOTOPES only -------------------
+[SCALAR G1] # IIIII     # WATER ACTIVATION
+mesh = fluid
+solver = none
+boundaryTypeMap = t,t,t,I,I, I,I,I,I,I
+residualTol = 1e-6
+
+[SCALAR G2]  # TRITIUM
+mesh = fluid
+#solver = none
+boundaryTypeMap = t,t,t,I,I, I,I,I,I,I
+residualTol = 1e-6
+
+[CASEDATA]
+# s2 = nondimensional on PbLi (the target scale) | s3 = + per-fluid U so U_inlet = O(1)
+scaleMode = s2
+
+# per-fluid viscosity multiplier, s2-level: Re_eff = Re/visc_scale
+visc_scale = 10.0, 10.0, 10.0   # PbLi, water1, water2
+
+# per-inlet FLOW-RATE multiplier (PbLi, water, water).
+inlet_flow_factor = 1.0, 0.01, 0.01 
+
+
+# OpenMC source files, one per source, read only when USE_OPENMC_SOURCE 1. Syntax is
+# "<file>+id=N[+int]", the same `+` convention as [GENERAL] startFrom; order does not matter.
+#   <file>  the FULL name (step -1, so no suffix is appended)
+#   +id=N   read scalarNN from that file. Default 0. Give it explicitly when one file holds
+#           more than one source, or all three keys would read scalar00.
+#   +int    interpolate onto this case's mesh (gfldr). Only for a source on a DIFFERENT mesh;
+#           it then must carry its own mesh coordinates. Omit it to read the file directly.
+# Three identical filenames with different id= read three scalars of one combined file.
+#   qvol [W/m3], n16 and t [particles/m3/s]
+# one file per source, each in scalar00:
+#srcfileqvol = "openmc_heat0.f00000+int"
+#srcfilen16  = "openmc_n160.f00000+int"
+#srcfilet    = "openmc_tritium0.f00000+int"
+# or one combined file, three slots:
+#srcfileqvol = "openmc0.f00000+id=0+int"
+#srcfilen16  = "openmc0.f00000+id=1+int"
+#srcfilet    = "openmc0.f00000+id=2+int"
+
+# Save the three loaded sources to ONE checkpoint, so a later run reads them back with no "+int".
+# Absent or empty = do not save; setting it is the on/off switch. srcfilesaveN defaults to 3.
+# Written WITH the mesh, in SI units, at [GENERAL] checkpointPrecision (which DEFAULTS TO 32 --
+# set checkpointPrecision = 64 for a bit-exact round trip; fp32 gives ~1e-7 relative) -- so the result is a DROP-IN for the OpenMC file:
+# same keys, USE_OPENMC_SOURCE stays 1, only "+int" is dropped. Scalars are ordered heat, T, N16
+# (NOT the load enum's order), so reload as
+#   srcfileqvol = "openmc_src0.f00000+id=0"   (heat)
+#   srcfilet    = "openmc_src0.f00000+id=1"
+#   srcfilen16  = "openmc_src0.f00000+id=2"
+# The log prints these three lines verbatim after a save.
+#srcfilesave  = "openmc_src"
+#srcfilesaveN = 3
+
+#resetFields = all # IC
+resetFields = none # from restart file, if presents
+#resetFields = temperature, isotopes # IIIII turn on temp and isotopes with new IC
+
+#ioStepAscent = 2000
+#debug_setup = 1 # let usr dumps more regarding surfaces
+
+

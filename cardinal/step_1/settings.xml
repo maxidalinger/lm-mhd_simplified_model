@@ -1,0 +1,20 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<settings>
+  <run_mode>fixed source</run_mode>
+  <particles>10000</particles>
+  <batches>500</batches>
+  <source type="independent" strength="1.0" particle="neutron">
+    <space type="cartesian">
+      <x type="discrete">
+        <parameters>44.5 44.500001</parameters>
+      </x>
+      <y type="uniform" parameters="-11.175 11.175"/>
+      <z type="uniform" parameters="-10.875 10.875"/>
+    </space>
+    <angle type="monodirectional" reference_uvw="-1.0 0.0 0.0"/>
+    <energy type="discrete">
+      <parameters>14100000.0 1.0</parameters>
+    </energy>
+  </source>
+  <max_history_splits>1000</max_history_splits>
+</settings>

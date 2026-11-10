@@ -1,0 +1,778 @@
+//
+// nekRS User Defined File -- PINK/TBM. Pair with pink_v20.hpp (install as pink.hpp), v20.par, v20.usr.
+//
+// Scales (notes/07_scale_formulation.md):
+//   s1  SI standard unit.
+//   s2  nondimensional units based on PbLi. The target scale. all I/O (ckpt, ascent) is s2.
+//   s3  s2 + per-fluid velocity rescale so U_inlet = O(1), for a bigger dt, initial transient.
+// Select with [CASEDATA] scaleMode = s2 | s3.
+// Only u and p are converted; phi, sigma, T, k, J and isotope c stay s2.
+
+#include "planarCopy.hpp"
+//#include "nekAscent.hpp"
+#include <time.h>
+#include <cmath>
+#include <cstring> // source::speciesIndex resolves a species by name
+
+// Physics switches -- 1 = on, 0 = off. The only place they are set.
+#define USE_MHD      0 // inductionless MHD                  (okl)
+#define USE_BUOYANCY 0 // Boussinesq                         (host)
+#define USE_RECYCLE  0 // recycled inlets, for the flowrate  (okl)
+#define USE_QVOL     1 // volumetric neutronic heating       (host)
+#define USE_QSURF    1 // FW surface heat flux               (host)
+#define USE_ISOTOPES 1 // isotope decay, coupled to qvol     (okl)
+#define USE_JOULE    0 // ohmic heating j^2/sigma into q'''  (host). Needs USE_MHD.
+#define USE_ISO_IMPLICIT 0 // isotope decay in lambda1, not the explicit source (host).
+                           // Needs USE_ISOTOPES.
+#define USE_OPENMC_SOURCE 0 // q''' and isotope production from OpenMC checkpoints (host).
+                            //   0 = analytic Beer-Lambert q''', isotope src = delay * q'''
+                            //   1 = loaded fields; isotope production added DIRECTLY (no delay)
+
+// recycle phi at the PbLi inlet too. Needs USE_RECYCLE && USE_MHD; 0 leaves phi = 0 there.
+#define USE_RECYCLE_PHI 0 // (okl) TODO, j dot n = 0
+
+// the three above are only meaningful together -- derived once, tested everywhere
+#define RECYCLE_PHI_ON (USE_RECYCLE && USE_MHD && USE_RECYCLE_PHI)
+
+// Included twice, once per udfMake target.
+// - okl.cpp only takes the lines code inside __okl__ (extract_ifdef)
+//   so the first include is for the OKL target in hpp
+// - the host compile does the reverse. pink.hpp guards its own two halves
+//   OKL target  (__okl__ defined)  -> the kernels
+//   udf target  (__okl__ undef)    -> the types, PinkCase, and the machinery
+#ifdef __okl__
+#include "pink.hpp"
+#endif
+#include "pink.hpp"
+
+// ================================================================================================================
+// INPUT TABLES -- SI (s1), straight from README_scales.md. Types are in pink.hpp.
+
+// DOMAINS -- one row per eTag (1-based). bid_outlet is -1 for solids.
+const std::vector<S1Domain> s1_domain = {
+//                                         Cp [J/kg-K],         sigma [S/m], beta [1/K],
+//  name,     kind, rho [kg/m3],  nu [m2/s],          k [W/m-K],                        T0 [C], bid_outlet
+  {"PbLi",     FLUID, 9838.0092, 2.1431e-07,  189.7752, 13.1837, 8.8345e+05, 1.2101e-04, 300.0,  4},
+  {"water1",   FLUID,  736.5819, 1.2287e-07, 5343.6739,  0.5718, 1.0000e-02, 2.6703e-03, 295.0,  5},
+  {"water2",   FLUID,  736.5819, 1.2287e-07, 5343.6739,  0.5718, 1.0000e-02, 2.6703e-03, 295.0,  6},
+  {"steelTBM", SOLID, 7691.0000,        0.0,  545.8260, 29.6061, 1.1868e+06,        0.0, 300.0, -1},
+};
+
+// REFERENCE SCALES (PbLi). L also rescales the MESH: the usr divides xm1 by it.
+// The reference SPEED is not here: it is s1_inlet's PbLi row, derived into cs.U_r.
+constexpr S1Units s1_unit = {
+  1,          //           eTag of the reference domain (PbLi)
+  9.6750e-02, // [m]       PbLi inlet diameter, used in usr
+  1.0,        // [K]       temperature scale
+  0.0,        // [C]       temperature offset
+  9.80665,    // [m/s2]    gravity
+  4.0,        // [T]       applied field -> par [MHD INDUCTIONLESS] by = 1
+  1.2566e-06, // [V-s/A-m] magnetic permeability
+};
+static_assert(s1_unit.L > 0.0, "s1_unit.L must be nonzero: the usr divides the mesh by it");
+
+// INLETS -- eTag names the owning domain, so the inlet->domain map is stated once, here.
+// D is the CHARACTERISTIC LENGTH (Re/Ha/N use it); A is the CROSS-SECTION mdot divides by.
+// PbLi's inlet is the rectangular 193.5x92.75mm BZ channel: D is the Hartmann HALF-HEIGHT
+// (96.75mm, not a pipe diameter), so A must be typed by hand from the duct's true area --
+// pi/4 D^2 would be wrong by ~2.44x in U (README.md Parameters; chk-s1 prints the circular
+// A as a reference so a mismatch here is visible, not silent).
+// Water inlets are true round pipes, so A = pi/4 D^2 is exact there.
+const std::vector<S1Inlet> s1_inlet = {
+//  name, bid, eTag,  D [m],      A [m2],     mdot [kg/s], T [C], setsDomainU, U [m/s]
+//  setsDomainU: this inlet's speed fixes its domain's s3 scale.  U: 0 = derive from mdot/(rho A).
+  {"PbLi",    1, 1, 9.6750e-02, 1.7947e-02, 4.0625e-02, 300.0, true, 0.0}, // rectangular duct: A typed, NOT pi/4 D^2 -- the reference domain, this speed IS U_r
+  {"water1",  2, 2, 8.0000e-03, 5.0265e-05, 2.4667e-02, 295.0, true, 0.0}, // round pipe: A = pi/4 D^2. waterTBM has two inlets, FW is the representative.
+  {"water2",  3, 3, 8.0000e-03, 5.0265e-05, 2.4667e-02, 295.0, true, 0.0}, // round pipe: A = pi/4 D^2
+};
+
+constexpr dfloat p_recycLength  = 0.05; // [m] recycling plane offset from the inlet
+
+// ================================================================================================================
+// ISOTOPES -- dc/dt + u.grad c = div(D grad c) - lambda*c + delay*q'''
+//   c is a concentration -> never scaled.  See PHYSICS.md / notes/08.
+//   lambda = ln2/T_half * L/U_r  [-]  a RATE, stored POSITIVE -> /U in s3
+//   delay  = production yield    [-]  a RATIO                 -> never scaled
+//   loop   = LOOP_CLOSED|LOOP_OPEN    a MODE                  -> never scaled
+// n_ref is PER SPECIES: n_hat = n_SI / n_ref. Pick it so the STEADY STATE is O(1), and the steady
+// state is production x RESIDENCE. The sources are only 5.7x apart; the concentrations are ~100x,
+// because the residences are not comparable at all:
+//
+//   N16  R = 5.82e17 /m3/s  saturates against DECAY, 1/lambda = 10.3 s   -> n_ss = R/lambda = 6.0e18
+//   T    R = 3.34e18 /m3/s  never decays; LOOP_OPEN, so the loop transit -> n_ss = R*tau   ~ 5e20
+//        (tau = path/U_PbLi; U_PbLi = 0.0199 m/s, so ~150 s over a 3 m path. Measure it: V_PbLi
+//         from chk-eTagSum VOL, tau = V*rho/mdot.)
+//
+// Both R values are the peaks of the loaded OpenMC fields (report Z sec 5). N16's R/lambda is an
+// UPPER bound -- a water transit is ~0.5 s, 20x shorter than 1/lambda, so an element leaves the
+// source region long before it saturates and the true peak is lower. 1e19 leaves room for that.
+const std::vector<IsotopeSpecies> s2_species = { //  name,  T_half [s],              n_ref [1/m3]
+  {"N16", 7.13,                   1.0}, // water activation, 7.13 s
+  {"T",   12.32 * 365.25 * 86400, 1.0}, // tritium, 12.32 yr
+};
+
+constexpr dfloat p_iso_transit        = 10.0;  // [-] outlet->inlet transit time, in L/U_r
+constexpr dfloat p_iso_transportCoeff = 1.0;
+
+constexpr dfloat s1_iso_D = 5.646e-9; // [m2/s] mass diffusivity, same for both species
+
+// [species][eTag]: one outer row per s2_species, one inner row per s1_domain
+// D is SI here; scale::setup() makes it 1/Pe_c = D/(L U_r) (= 4.3625e-06), as it does
+// lambda from T_half. Leave lambda 0.
+// loop: LOOP_CLOSED recirculates the outlet back to this domain's inlets, LOOP_OPEN zeroes it
+// (once-through). Fatal if omitted wherever bid_outlet > 0 -- there is no default to guess.
+// Solids have no loop so it is inert there, but every row states one anyway: nobody should have
+// to work out whether a blank matters (plan V).
+const std::vector<std::vector<IsotopeParams>> s2_isotope = {
+  { //  D,  delay, lambda, loop        N16 -- water activation
+    {s1_iso_D, 0.0, 0, LOOP_CLOSED}, // PbLi      (no N16 production)
+    {s1_iso_D, 1.0, 0, LOOP_CLOSED}, // water1
+    {s1_iso_D, 1.0, 0, LOOP_CLOSED}, // water2
+    {0.0,      0.0, 0, LOOP_CLOSED}, // steelTBM  solid: inert, stated for uniformity
+  },
+  { //  D,  delay, lambda, loop        T -- tritium, bred by Li6(n,alpha)T: PbLi only
+    {s1_iso_D, 1.0, 0, LOOP_OPEN  }, // PbLi      once-through: bounds n_T at ~qbar*tau_res
+    {s1_iso_D, 0.0, 0, LOOP_CLOSED}, // water1  (no Li; D != 0 -- permeated T still transports)
+    {s1_iso_D, 0.0, 0, LOOP_CLOSED}, // water2   (no Li)
+    {0.0,      0.0, 0, LOOP_CLOSED}, // steelTBM  solid: inert, stated for uniformity
+  },
+};
+
+// ================================================================================================================
+// HEAT SOURCE -- the scales are derived in scale::derive_s2().
+constexpr dfloat s1_qflux = 0.25e3; // [W/m2] plasma surface flux applied to the FW
+constexpr dfloat s1_I0    = 1.1e6;  // [W/m2] incident neutron intensity at the FW
+
+
+// Group every params in one object; aggregate init, PinkCase's field order (pink.hpp).
+// Everything after p_iso_transportCoeff is derived, and starts empty.
+PinkCase cs{s1_domain, s1_inlet, s2_species, s1_unit, s2_isotope,
+            s1_qflux, s1_I0, p_recycLength, p_iso_transit, p_iso_transportCoeff};
+
+
+#ifdef __okl__
+void udfDirichlet(bcData *bc)
+{
+  if (isField("fluid velocity")) { // inlet
+#if !USE_RECYCLE
+    if (bc->id == 1) { // pbli
+      bc->uxFluid = -bc->nx * abs(p_u_inlet1);
+      bc->uyFluid = 0.0;
+      bc->uzFluid = 0.0;
+    } else if (bc->id == 2) { // water1
+      bc->uxFluid = -bc->nx * abs(p_u_inlet2);
+      bc->uyFluid = 0.0;
+      bc->uzFluid = 0.0;
+    } else if (bc->id == 3) { // water2
+      bc->uxFluid = -bc->nx * abs(p_u_inlet3);
+      bc->uyFluid = 0.0;
+      bc->uzFluid = 0.0;
+    }
+#else
+    if (bc->id == 1 || bc->id == 2 || bc->id == 3) {
+      bc->uxFluid = bc->usrwrk[bc->idxVol + 0 * bc->fieldOffset];
+      bc->uyFluid = bc->usrwrk[bc->idxVol + 1 * bc->fieldOffset];
+      bc->uzFluid = bc->usrwrk[bc->idxVol + 2 * bc->fieldOffset];
+    }
+#endif
+  } else if (isField("fluid pressure")) { // outlet
+    const dfloat iU0delta = 20.0;
+    const dfloat un = bc->uxFluid * bc->nx + bc->uyFluid * bc->ny + bc->uzFluid * bc->nz;
+    const dfloat s0 = 0.5 * (1.0 - tanh(un * iU0delta));
+    bc->pFluid = -0.5 * (bc->uxFluid * bc->uxFluid + bc->uyFluid * bc->uyFluid + bc->uzFluid * bc->uzFluid) * s0;
+  } else if (isField("scalar temperature")) {
+    bc->sScalar = 0.0;
+    if (bc->id == 1) {        // pbli
+      bc->sScalar = p_T_inlet1;
+    } else if (bc->id == 2) { // water1
+      bc->sScalar = p_T_inlet2;
+    } else if (bc->id == 3) { // water2
+      bc->sScalar = p_T_inlet3;
+    }
+#if USE_MHD
+  } else if (isField("mhd inductionless")) {
+    if (bc->id == 1) { // PbLi inlet
+#if RECYCLE_PHI_ON
+      bc->sScalar = bc->usrwrk[bc->idxVol + 3 * bc->fieldOffset];
+#else
+      bc->sScalar = 0.0;
+#endif
+    } else {
+      bc->sScalar = 0.0;
+    }
+#endif
+  }
+
+#if USE_ISOTOPES // IIIII
+  // usrwrk holds the recirculated inlet value indexed by bc->id, so no bid is named here and
+  // the bid->domain map stays host-side (isotopes::updateBC). Non-inlet slots are 0.
+  //if (bc->id > 0 && bc->id < p_isoBidSlots) {
+  //  const int base = p_bc_usrwrk_nfld * bc->fieldOffset + bc->id * p_NumOfIsotopes;
+  //  if (isField("scalar g1")) {        // N16
+  //    bc->sScalar = 0.0; //bc->usrwrk[base + 0];
+  //  } else if (isField("scalar g2")) { // T
+  //    bc->sScalar = 0.0; //bc->usrwrk[base + 1];
+  //  }
+  //}
+  if (isField("scalar g1"))
+  {
+    bc->sScalar = 0.0;
+  }
+  if (isField("scalar g2")) {
+    bc->sScalar = 0.0;
+    if (bc->id == 1) {        // pbli
+      bc->sScalar = 0.0;
+    } else if (bc->id == 2) { // water1
+      bc->sScalar = 0.0;
+    } else if (bc->id == 3) { // water2
+      bc->sScalar = 0.0;
+    }
+  }
+#endif
+}
+
+void udfNeumann(bcData *bc)
+{
+  if (isField("scalar temperature")) {
+    if (bc->id==7) { // enclosure xmax (FW)
+      bc->fluxScalar = 0.0;
+      if (bc->nx > 0) { // FW facing xmax
+        bc->fluxScalar = abs(bc->nx) * p_qflux;
+      }
+    } else {
+      bc->fluxScalar = 0.0;
+    }
+  } else if (isField("mhd inductionless")) {
+    bc->fluxScalar = 0.0;
+  }
+}
+
+// FUNCTION TO APPLY CARDINAL HEAT SOURCE
+@kernel void mooseHeatSource(const dlong Nelements,
+                             const dlong offset,
+                             @restrict const dfloat *source,
+                             @restrict dfloat *QVOL)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+      QVOL[id] = source[offset + id];
+    }
+  }
+}
+
+// FUNCTION TO APPLY CARDINAL TRITIUM SOURCE
+@kernel void mooseTritiumSource(const dlong Nelements,
+                                const dlong offset,
+                                @restrict dfloat *scalar,
+                                @restrict const dfloat *source,
+                                @restrict dfloat *QVOL,
+                                const dfloat coeff,
+                                const dfloat coeff2)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+      
+      QVOL[id] = -coeff * scalar[id] + source[offset + id] * coeff2;
+      //QVOL[id] = -coeff * scalar[id];
+      //QVOL[id] = source[offset + id] * coeff2;
+    }
+  }
+}
+
+// TEST TEST TEST TEST
+@kernel void tritiumSource(const dlong Nelements,
+                                const dlong offset,
+                                @restrict dfloat *scalar,
+                                @restrict const dfloat *source,
+                                const dfloat coeff)
+{
+  for(dlong e=0;e<Nelements;++e;@outer(0)){
+    for(int n=0;n<p_Np;++n;@inner(0)){
+      const int id = e*p_Np + n;
+      
+      scalar[id] = source[offset + id] * coeff;
+    }
+  }
+}
+#endif // __okl__
+
+// UDF_Setup0 -- ALL parameter work. Runs before the solvers exist.
+// Read control from par, derive s2/s3 from s1 table.
+void UDF_Setup0(MPI_Comm comm, setupAide &options)
+{
+  platform->options.setArgs("CHECKPOINT OUTPUT MESH", "TRUE"); // dump mesh
+  platform->options.setArgs("RUNTIME STATISTICS FREQUENCY", "50");
+//platform->options.setArgs("RUNTIME STATISTICS FREQUENCY", "500"); // PPPPP
+  platform->options.setArgs("FLUID PRESSURE ELLIPTIC COEFF FIELD", "TRUE");
+  platform->options.setArgs("FLUID PRESSURE ELLIPTIC PRECO COEFF FIELD", "TRUE");
+
+  { // hScale
+    hScale = 1;
+    std::string hSchedule;
+    if (platform->options.getArgs("MESH HREFINEMENT SCHEDULE", hSchedule)) {
+      int ncut = 1;
+      constexpr int ndim = 3;
+      for (auto &&s : serializeString(hSchedule, ',')) {
+        ncut *= std::stoi(s);
+      }
+      if (ncut > 1) {
+        hScale = static_cast<int>(std::pow(ncut, ndim));
+      }
+    }
+  }
+
+  // determine nfld used in bc->usrwrk: 3 velocity components, +1 for a recycled phi
+#if USE_RECYCLE
+  p_bc_usrwrk_nfld = 3;
+#if RECYCLE_PHI_ON
+  p_bc_usrwrk_nfld = 4;
+#endif
+#endif
+
+#if USE_ISOTOPES // IIIII
+  NumOfIsotopes = static_cast<int>(s2_species.size()); // the species table is the count
+#endif
+
+  platform->par->extract("casedata", "debug_setup", debug_setup);
+  platform->par->extract("casedata", "ioStepAscent", ioStepAscent);
+
+  auto read_list_from_par = [&](const std::string &key,
+                                std::vector<dfloat> &vec)
+  {
+    std::string str_vals;
+    if (!platform->par->extract("casedata", key, str_vals)) {
+      return;
+    }
+
+    const auto list = serializeString(str_vals, ',');
+    if (list.size() == 1) {
+      const dfloat scale = static_cast<dfloat>(std::stod(list[0]));
+      for (auto &v : vec) {
+        v *= scale;
+      }
+    } else {
+      const int n = std::min<int>(list.size(), vec.size());
+      for (int i = 0; i < n; ++i) {
+        vec[i] *= static_cast<dfloat>(std::stod(list[i]));
+      }
+    }
+  };
+
+  p_inletFlowFactor.assign(cs.s1_inlet.size(), 1.0); // the inlet table is the count
+  read_list_from_par("inlet_flow_factor", p_inletFlowFactor);
+  read_list_from_par("visc_scale", p_visc_scale);
+
+  read_resetFields(cs);
+
+  if (platform->comm.mpiRank() == 0) {
+    print_vec("chk-prop", "inletFlowFactor", p_inletFlowFactor);
+    print_vec("chk-prop", "p_visc_scale", p_visc_scale);
+  }
+
+  // switch combinations that cannot work
+#if USE_ISOTOPES && !USE_QVOL
+  nekrsCheck(1,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "USE_ISOTOPES requires USE_QVOL");
+#endif
+
+  // take over checkpointing: the fields must be converted to s2 before every write, so
+  // the interval is read here and the solver's own scheduling is disabled.
+  nekrsCheck(!platform->options.compareArgs("CHECKPOINT CONTROL", "STEPS"),
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "%s\n",
+             "this udf needs [GENERAL] checkpointControl = steps");
+  platform->options.getArgs("CHECKPOINT INTERVAL", ioStepCheckpoint);
+  platform->options.setArgs("CHECKPOINT INTERVAL", "-1");
+
+  // s1 -> s2, then the s3 mode. Must precede the mhd ctor (reads the coeffs) and
+  // UDF_LoadKernels (reads p_U_inlet).
+  scale::derive_s2(cs);
+  scale::setup(cs); // setup Uscale, prepare for s3
+  scale::apply(cs); // apply s2 or s3
+
+  if (platform->options.compareArgs("BUILD ONLY", "FALSE")) {
+    *nek::ptr<int>("hscale") = hScale; // usr uses this to set etag
+    *nek::ptr<double>("dp_pbli") = cs.s1_unit.L; // usr rescales the mesh by 1/L
+    *nek::ptr<int>("debug_setup") = debug_setup; // usr print more f0000 on mesh surface.
+  }
+}
+
+void UDF_LoadKernels(deviceKernelProperties& kernelInfo) // called after UDF_Setup0
+{
+#if !USE_QSURF
+  cs.p_qflux = 0.0; // off swtich
+#endif
+
+  // physics switches -> okl. Values
+  kernelInfo.define("USE_MHD")      = USE_MHD;
+  kernelInfo.define("USE_RECYCLE")  = USE_RECYCLE;
+  kernelInfo.define("USE_RECYCLE_PHI") = USE_RECYCLE_PHI;
+  kernelInfo.define("RECYCLE_PHI_ON")  = RECYCLE_PHI_ON;
+  kernelInfo.define("USE_ISOTOPES") = USE_ISOTOPES;
+  if (platform->comm.mpiRank() == 0) {
+    printf("chk-okl USE_MHD      = %d (okl)\n",  USE_MHD);
+    printf("chk-okl USE_RECYCLE  = %d (okl)\n",  USE_RECYCLE);
+    printf("chk-okl USE_RECYCLE_PHI = %d -> phi recycled: %d (okl)\n",
+           USE_RECYCLE_PHI, RECYCLE_PHI_ON);
+    printf("chk-okl USE_ISOTOPES = %d (okl)\n",  USE_ISOTOPES);
+    printf("chk-okl USE_QVOL     = %d (host)\n", USE_QVOL);
+    printf("chk-okl USE_QSURF    = %d (host)\n", USE_QSURF);
+    printf("chk-okl USE_BUOYANCY = %d (host)\n", USE_BUOYANCY);
+    printf("chk-okl USE_JOULE    = %d (host)\n", USE_JOULE);
+    printf("chk-okl USE_ISO_IMPLICIT = %d (host)\n", USE_ISO_IMPLICIT);
+    fflush(stdout);
+  }
+
+  // bc values
+  kernelInfo.define("p_qflux") = cs.p_qflux;
+  kernelInfo.define("p_bc_usrwrk_nfld") = p_bc_usrwrk_nfld; // used by USE_ISOTOPES okl
+  kernelInfo.define("p_NumOfIsotopes") = NumOfIsotopes;
+#if USE_ISOTOPES
+  kernelInfo.define("p_isoBidSlots") = isoBidSlots(cs); // usrwrk is indexed by bc->id
+#endif
+  std::vector<dfloat> u_inlet_okl(cs.s2_inlet.size());
+  for (size_t i = 0; i < cs.s2_inlet.size(); ++i) {
+    u_inlet_okl[i] = -std::abs(p_inletFlowFactor[i] * cs.p_U_inlet[i]);
+  }
+  nekrsCheck(cs.s2_inlet.size() != 3,
+             platform->comm.mpiComm(),
+             EXIT_FAILURE,
+             "okl expects exactly 3 inlets, table has %d\n",
+             static_cast<int>(cs.s2_inlet.size()));
+  kernelInfo.define("p_u_inlet1") = u_inlet_okl[0]; // vel inlet
+  kernelInfo.define("p_u_inlet2") = u_inlet_okl[1];
+  kernelInfo.define("p_u_inlet3") = u_inlet_okl[2];
+
+  // p_T_inlet1..3, from the s1_inlet table
+  std::vector<dfloat> T_inlet_okl(cs.s2_inlet.size());
+  for (size_t i = 0; i < cs.s2_inlet.size(); ++i) {
+    T_inlet_okl[i] = cs.s2_inlet[i].T_inlet;
+  }
+  kernelInfo.define("p_T_inlet1") = T_inlet_okl[0]; // temp inlet
+  kernelInfo.define("p_T_inlet2") = T_inlet_okl[1];
+  kernelInfo.define("p_T_inlet3") = T_inlet_okl[2];
+  if (platform->comm.mpiRank() == 0) {
+    printf("chk-bc qflux %.8e\n", cs.p_qflux);
+    printf("chk-bc p_bc_usrwrk_nfld %d\n", p_bc_usrwrk_nfld);
+    printf("chk-bc p_NumOfIsotopes %d\n", NumOfIsotopes);
+    for (size_t i = 0; i < cs.s2_inlet.size(); ++i) {
+      printf("chk-bc p_u_inlet%zu %.8e  p_T_inlet%zu %.8e  (%s bid=%d eTag=%d)\n",
+             i + 1, u_inlet_okl[i], i + 1, T_inlet_okl[i],
+             cs.s2_inlet[i].name, cs.s2_inlet[i].bid, cs.s2_inlet[i].eTag);
+    }
+  }
+}
+
+void uservp(double time)
+{
+  auto& fluid = nrs->fluid;
+  auto& scalar = nrs->scalar;
+
+  if (updateProperties) {
+    if (platform->comm.mpiRank() == 0) {
+      std::cout << "updating properties\n";
+    }
+
+    { // velocity
+      auto mesh = fluid->mesh;
+      auto o_mue = fluid->o_prop.slice(0 * fluid->fieldOffset);
+      auto o_rho = fluid->o_prop.slice(1 * fluid->fieldOffset);
+      etag::setProp(mesh, o_rho, etag::field(cs, &Domain::rho));
+      etag::setProp(mesh, o_mue, etag::field(cs, &Domain::mue));
+    }
+    { // temperature
+      auto mesh = scalar->mesh("temperature");
+      auto o_con = scalar->o_diffusionCoeff("temperature");
+      auto o_rhoCp = scalar->o_transportCoeff("temperature");
+      etag::setProp(mesh, o_rhoCp, etag::field(cs, &Domain::rhoCp));
+      etag::setProp(mesh, o_con, etag::field(cs, &Domain::conT));
+    }
+#if USE_MHD
+    mhd::properties(cs); // o_sigma, o_ulocScale
+#endif
+#if USE_ISOTOPES
+    isotopes::properties(cs);
+#endif
+    updateProperties = 0;
+  }
+}
+
+void userSource(double time)
+{
+  static auto firstCall = true;
+
+  auto& fluid = nrs->fluid;
+  auto& scalar = nrs->scalar;
+
+  if (firstCall) {
+
+#if USE_BUOYANCY
+    {
+      auto mesh = fluid->mesh;
+      o_RiRhoBeta.resize(mesh->Nlocal);
+      o_tempBase.resize(mesh->Nlocal);
+
+      // temp0 is already (T0 - Tinf)/Tr -- scale::derive_s2 applies it. Do not transform again.
+      std::vector<dfloat> tempBase = etag::field(cs, &Domain::temp0);
+
+      if (platform->comm.mpiRank() == 0) {
+        // coef is a FORCE DENSITY; o_explicitTerms wants coef/rho -- see notes/18 and below.
+        const std::vector<dfloat> rho = etag::field(cs, &Domain::rho);
+        std::vector<dfloat> accel = etag::field(cs, &Domain::RiRhoBeta);
+        for (size_t i = 0; i < accel.size(); ++i) {
+          accel[i] /= rho[i];
+        }
+        printf("chk-buoy Tr= %.4e  Tinfty= %.4e\n", cs.s1_unit.Tr, cs.s1_unit.Tinf);
+        print_vec("chk-buoy", "coef", etag::field(cs, &Domain::RiRhoBeta));
+        print_vec("chk-buoy", "rho", rho);
+        print_vec("chk-buoy", "accel", accel);
+        print_vec("chk-buoy", "Tref", tempBase);
+        fflush(stdout);
+      }
+      etag::setProp(mesh, o_RiRhoBeta, etag::field(cs, &Domain::RiRhoBeta));
+      etag::setProp(mesh, o_tempBase, tempBase);
+    }
+#endif
+
+#if USE_OPENMC_SOURCE
+    // One explicit line per source. File, scalar slot and interpolation all come from that
+    // source's own [CASEDATA] key, e.g. srcfileqvol = "openmc_heat0.f00000+int" (scalar00), or
+    // "...+id=1+int" when one file holds several sources.
+#if USE_QVOL
+    //source::load_source(cs, source::SRC_QVOL); // [W/m3]   -> o_qvol (/ p_qvol_scale)
+#endif
+#if USE_ISOTOPES
+    //source::load_source(cs, source::SRC_N16);  // [1/m3/s] -> o_iso_src[N16]
+    //source::load_source(cs, source::SRC_T);    // [1/m3/s] -> o_iso_src[T]
+#endif
+    // Optional: dump the three loaded sources to one low-order file, back in SI (scalars:
+    // heat, T, N16). No-op unless [CASEDATA] srcfilesave is set. The result is a drop-in for
+    // the OpenMC file -- same keys, same USE_OPENMC_SOURCE 1, and no "+int" needed.
+    source::save_source(cs);
+#elif USE_QVOL
+    //heat::setupQvol(cs); // setup o_qvol -- the analytic Beer-Lambert profile
+#endif
+#if USE_JOULE
+    heat::setupJoule(cs); // setup o_jouleCoeff
+#endif
+    firstCall = false;
+  }
+
+#if USE_BUOYANCY
+  { // buoyancy:  F/rho +=  -(RiRhoBeta/rho) * ( T - T0 ) * ghat
+    auto mesh = fluid->mesh;
+    auto o_F = fluid->o_explicitTerms();
+    auto o_T = scalar->o_solution("temperature");
+    poolDeviceMemory<dfloat> o_buoyancy(mesh->Nlocal);
+
+    // o_buoyancy = (RiRhoBeta) * ( T - T0 )
+    platform->linAlg->axpbyz(mesh->Nlocal, 1.0, o_T, -1.0, o_tempBase, o_buoyancy);
+    platform->linAlg->axmy(mesh->Nlocal, 1.0, o_RiRhoBeta, o_buoyancy);
+
+    // o_explicitTerms is an ACCELERATION (f/rho), not a force density -- notes/18. RiRhoBeta
+    // is a force-density coefficient, so divide by rho here, as NekRS does for the Lorentz
+    // force (nrs.cpp:2043). aydx: o_buoyancy = 1.0 * o_buoyancy / o_rho.
+    platform->linAlg->aydx(mesh->Nlocal, 1.0, fluid->o_rho, o_buoyancy);
+
+    const std::vector<dfloat> ghat = {0.0, 0.0, -1.0}; // z+ is up, gravity along z-
+    platform->linAlg->axpby(mesh->Nlocal, -ghat[0], o_buoyancy, 1.0, o_F, 0, 0*fluid->fieldOffset);
+    platform->linAlg->axpby(mesh->Nlocal, -ghat[1], o_buoyancy, 1.0, o_F, 0, 1*fluid->fieldOffset);
+    platform->linAlg->axpby(mesh->Nlocal, -ghat[2], o_buoyancy, 1.0, o_F, 0, 2*fluid->fieldOffset);
+  }
+#endif
+
+#if USE_QVOL
+  { // SSSSS userq
+    auto mesh = nrs->meshT;
+    //scalar->o_explicitTerms("temperature").copyFrom(o_qvol, mesh->Nlocal);
+  }
+#endif
+
+#if USE_JOULE
+  heat::jouleSource(); // += q_M'''. After the copyFrom above, which overwrites.
+#endif
+
+#if USE_ISOTOPES
+  //isotopes::source(); // reads o_qvol, so order-independent of the two blocks above
+#endif
+
+// APPLY CARDINAL VOLUMETRIC SOURCES
+  for(int is = 0; is < nrs->scalar->NSfields; is++)
+  {
+    auto mesh = nrs->scalar->mesh(is);
+    if (is == 0)
+    {
+      mooseHeatSource(mesh->Nelements, 
+                      is,
+                      platform->app->bc->o_usrwrk + is * nrs->fieldOffset,
+                      nrs->scalar->o_EXT + nrs->scalar->fieldOffsetScan[is]);
+    }
+    if (is == 2)
+    {
+      const dfloat L      = s1_unit.L;
+      const dfloat U      = s1_inlet[0].mdot/(s1_domain[0].rho * s1_inlet[0].A);
+      const dfloat lambda = std::log(2.0)/s2_species[1].T_half;
+      const dfloat coeff  = (lambda * L) / U;
+      
+      // WARNING: CARDINAL IS DOING BULLSHIT WHEN MAKING THE PASSIVE SCALAR SOURCE
+      // NONDIMENSIONAL. IT DIVIDES THE SOURCE BY THE REFERENCE HEAT SOURCE 
+      // Q_REF = rho * U * Cp * dT / L. IT IS NCESSARY TO MULTIPLY BY IT TO GET
+      // REAZONABLE VAUES. THIS IS NOT CORRECTED WHEN MAKING THE PASSIVE SCALAR 
+      // RESULTS DIMENSIONAL.
+      const dfloat rho = s1_domain[0].rho;
+      const dfloat Cp  = s1_domain[0].Cp;
+      const dfloat dT  = s1_unit.Tr;
+      const dfloat Q_REF = rho * U * Cp * dT / L;
+      
+      const dfloat transport_coeff_2 = 1.0;
+      const dfloat ds02 = 1.0e+16;
+      const dfloat S_REF = transport_coeff_2 * U * ds02 / L;
+      
+      //tritiumSource(mesh->Nelements,
+      //              is,
+      //              nrs->scalar->o_solution("g2"),
+      //              platform->app->bc->o_usrwrk + is * nrs->fieldOffset,
+      //              Q_REF / S_REF);
+      
+      mooseTritiumSource(mesh->Nelements, 
+                         is,
+                         nrs->scalar->o_solution("g2"),
+                         platform->app->bc->o_usrwrk + is * nrs->fieldOffset,
+                         nrs->scalar->o_EXT + nrs->scalar->fieldOffsetScan[is],
+                         coeff,
+                         Q_REF / S_REF);
+    }
+  }
+}
+
+
+// UDF_Setup -- the remainder, i.e. everything that needs eTag or a live solver:
+// device arrays sized per element, per-domain properties, IC, and the plugins.
+void UDF_Setup()
+{
+  nrs->userProperties = &uservp;
+  nrs->userSource = &userSource;
+
+  etag::setup(cs); // read etag from usr, set o_etag
+
+  // per-domain volume: sum(o_LMM) per eTag, cross-checked against mesh->volume.
+  // The usr prints the same thing from Nek's bm1 (chk_etag_glsum) -- two independent routes.
+  etag::printVolume(nrs->meshT, eTag);
+
+  scale::upload(cs); // setup for s2/s3 rescale
+  scale::check(cs);
+
+#if USE_MHD
+  mhd::setup(cs); // check only; o_sigma/o_ulocScale are written in mhd::properties
+#endif
+
+#if USE_ISOTOPES
+  //isotopes::setup(cs); // check the G scalars, upload delay/-lambda (+ lambda1 if implicit)
+#endif
+
+
+// INITIAL CONDITIONS
+  if (platform->options.getArgs("RESTART FILE NAME").empty())
+  {
+    auto &scalar = nrs->scalar;
+    // WATER ACTIVATION
+    {
+      auto mesh = scalar->mesh("g1");
+      auto [x, y, z] = mesh->xyzHost();
+      std::vector<dfloat> S1(mesh->Nlocal);
+
+      for(int n = 0; n < mesh->Nlocal; n++)
+      {
+        S1[n] = 0.0; 
+      }
+      scalar->o_solution("g1").copyFrom(S1.data(), S1.size());
+    }
+    // TRITIUM
+    {
+      auto mesh = scalar->mesh("g2");
+      auto [x, y, z] = mesh->xyzHost();
+      std::vector<dfloat> S2(mesh->Nlocal);
+    
+      for(int n = 0; n < mesh->Nlocal; n++)
+      {
+        S2[n] = 0.0;
+      }
+      scalar->o_solution("g2").copyFrom(S2.data(), S2.size());
+    }
+  }
+
+//  allocate_usrwrk(cs); // --> DONE BY CARDINAL. no recycling
+
+#if USE_RECYCLE
+  recycle::setup(cs);
+#endif
+
+  setup_ic(cs, 0.0); // handles fresh vs restart internally, per [CASEDATA] resetFields
+
+  scale::toSolve(cs, 0.0, 0); // convert IC to s3 scale
+
+  setup_ascent();
+}
+
+void UDF_ExecuteStep(double time, int tstep)
+{
+  int iostep = 0;
+  platform->options.getArgs("RUNTIME STATISTICS FREQUENCY", iostep);
+
+  int ioChk = 100;
+  platform->par->extract("casedata", "ioChk", ioChk);
+
+  // pure schedule test: is this a multiple of ioFreq? tstep is captured. Verbosity is NOT
+  // folded in here -- it would turn [GENERAL] verbose into "checkpoint every step". The
+  // reporting functions OR in platform->verbose() themselves.
+  auto ifpost = [tstep](int ioFreq) {
+    return (ioFreq > 0 && tstep > 0 && (tstep % ioFreq == 0));
+  };
+  const bool verbose = ifpost(ioChk);
+
+#if USE_RECYCLE
+  recycle::apply(cs, time, tstep, verbose||(tstep<10));
+#endif
+
+#if USE_ISOTOPES
+  //isotopes::updateBC(cs, time, tstep, verbose||(tstep<10));
+#endif
+
+  clipt(1000000.0, 1000000000.0); // limit min max of scalars, Tmax, isomax
+
+  if (!nrs->timeStepConverged) {
+    return;
+  }
+
+  if (tstep < 10 || tstep % 10 ==0 || verbose) {
+    computeCFL(time, tstep); // cfl per fluid
+  }
+  report_solution_minmax(time, tstep, verbose); // all per-step printing
+
+#ifdef NEKRS_ASCENT_ENABLED
+  if (ifpost(ioStepAscent) && (time > 0.0)) {
+    scale::toOutput(cs, time, tstep);
+    report_ascent_fields_minmax(time, tstep, verbose); // print eTag's min max for s2 scale.
+    nekAscent::run(time, tstep);
+    scale::toSolve(cs, time, tstep);
+  }
+  if (nrs->lastStep) nekAscent::finalize();
+#endif
+
+  // manual control of checkpointing: writeInterval from the par, applied here because
+  // UDF_Setup sets CHECKPOINT INTERVAL = -1 so the I/O must be bracketed by the rescale.
+  if (ifpost(ioStepCheckpoint)) {
+    scale::toOutput(cs, time, tstep);
+    nrs->writeCheckpoint(time);
+#if USE_MHD
+    dump_extra_mhd_files(time);
+#endif
+    scale::toSolve(cs, time, tstep);
+  }
+}

@@ -1,0 +1,11 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<geometry>
+  <cell id="1000000" fill="1" region="1 -2 3 -4 5 -6" universe="2"/>
+  <dagmc_universe id="1" auto_geom_ids="true" filename="/lustre/orion/nfu106/proj-shared/dalinger/inputs/lm-mhd/simplified_model/2-moose-openmc/test_4_yuhsiang_geometry/lm-mhd_dagmc.h5m"/>
+  <surface id="1" type="x-plane" boundary="vacuum" coeffs="-0.01"/>
+  <surface id="2" type="x-plane" boundary="vacuum" coeffs="44.51"/>
+  <surface id="3" type="y-plane" boundary="vacuum" coeffs="-11.185"/>
+  <surface id="4" type="y-plane" boundary="vacuum" coeffs="11.185"/>
+  <surface id="5" type="z-plane" boundary="vacuum" coeffs="-10.885"/>
+  <surface id="6" type="z-plane" boundary="vacuum" coeffs="10.885"/>
+</geometry>
